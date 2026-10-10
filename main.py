@@ -1,8 +1,8 @@
 
-
 import os
 import sys
 import json
+import re
 import traceback
 from io import StringIO
 from typing import List
@@ -37,45 +37,79 @@ class ErrorAnalysis(BaseModel):
 
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
-    captured = StringIO()
-    sys.stdout = captured
+    captured_stdout = StringIO()
+    captured_stderr = StringIO()
+
+    sys.stdout = captured_stdout
+    sys.stderr = captured_stderr
 
     try:
         exec(compile(code, "<string>", "exec"), {})
-        return {"success": True, "output": captured.getvalue()}
+        output = captured_stdout.getvalue()
+        return {"success": True, "output": output}
+
     except Exception:
-        return {"success": False, "output": traceback.format_exc()}
+        output = traceback.format_exc()
+        return {"success": False, "output": output}
+
     finally:
         sys.stdout = old_stdout
+        sys.stderr = sys.__stderr__
 
 
-def analyze_error_with_ai(code: str, error_traceback: str) -> List[int]:
+def analyze_error_with_ai(
+    code: str, error_traceback: str
+) -> List[int]:
     response = client.chat.completions.create(
         model="openai/gpt-4.1-nano",
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Find the exact 1-based line number where the "
-                    "exception occurred in the submitted Python code. "
-                    "Return JSON only: {\"error_lines\": [3]}. "
+                    "Analyze the Python code and traceback. "
+                    "Return JSON with an error_lines array of integers. "
+                    "Use 1-based line numbers from the submitted code. "
+                    "Identify the line where the exception was raised. "
                     "Do not invent line numbers."
                 ),
             },
             {
                 "role": "user",
-                "content": f"CODE:\n{code}\n\nTRACEBACK:\n{error_traceback}",
+                "content": (
+                    f"CODE:\n{code}\n\n"
+                    f"TRACEBACK:\n{error_traceback}\n\n"
+                    'Return JSON: {"error_lines": [3]}'
+                ),
             },
         ],
         response_format={"type": "json_object"},
     )
 
-    data = json.loads(response.choices[0].message.content)
+    content = response.choices[0].message.content
+    data = json.loads(content)
     result = ErrorAnalysis.model_validate(data)
+
     return sorted(set(
-        n for n in result.error_lines
-        if 1 <= n <= len(code.splitlines())
+        line for line in result.error_lines
+        if 1 <= line <= len(code.splitlines())
     ))
+
+
+def extract_error_lines(code: str, error_traceback: str) -> List[int]:
+    matches = re.findall(
+        r'File "<string>", line (\d+)',
+        error_traceback,
+    )
+
+    if not matches:
+        return []
+
+    line = int(matches[-1])
+
+    if 1 <= line <= len(code.splitlines()):
+        return [line]
+
+    return []
 
 
 @app.post("/code-interpreter")
@@ -83,14 +117,33 @@ def code_interpreter(request: CodeRequest):
     execution = execute_python_code(request.code)
 
     if execution["success"]:
-        return {"error": [], "result": execution["output"]}
+        return {
+            "error": [],
+            "result": execution["output"],
+        }
 
+    # AI analyzes the traceback only when execution fails.
     try:
-        lines = analyze_error_with_ai(request.code, execution["output"])
+        error_lines = analyze_error_with_ai(
+            request.code,
+            execution["output"],
+        )
     except Exception:
-        lines = []
+        error_lines = []
 
-    return {"error": lines, "result": execution["output"]}
+    # Use the traceback to correct or recover the line number.
+    traceback_lines = extract_error_lines(
+        request.code,
+        execution["output"],
+    )
+
+    if traceback_lines:
+        error_lines = traceback_lines
+
+    return {
+        "error": error_lines,
+        "result": execution["output"],
+    }
 
 
 @app.get("/")
