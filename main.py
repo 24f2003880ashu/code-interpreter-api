@@ -37,65 +37,34 @@ class ErrorAnalysis(BaseModel):
 
 def execute_python_code(code: str) -> dict:
     old_stdout = sys.stdout
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
-
-    sys.stdout = captured_stdout
-    sys.stderr = captured_stderr
+    old_stderr = sys.stderr
+    stdout_buffer = StringIO()
+    stderr_buffer = StringIO()
 
     try:
+        sys.stdout = stdout_buffer
+        sys.stderr = stderr_buffer
+
         exec(compile(code, "<string>", "exec"), {})
-        output = captured_stdout.getvalue()
-        return {"success": True, "output": output}
+
+        return {
+            "success": True,
+            "output": stdout_buffer.getvalue(),
+        }
 
     except Exception:
-        output = traceback.format_exc()
-        return {"success": False, "output": output}
+        return {
+            "success": False,
+            "output": traceback.format_exc(),
+        }
 
     finally:
         sys.stdout = old_stdout
-        sys.stderr = sys.__stderr__
-
-
-def analyze_error_with_ai(
-    code: str, error_traceback: str
-) -> List[int]:
-    response = client.chat.completions.create(
-        model="openai/gpt-4.1-nano",
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Analyze the Python code and traceback. "
-                    "Return JSON with an error_lines array of integers. "
-                    "Use 1-based line numbers from the submitted code. "
-                    "Identify the line where the exception was raised. "
-                    "Do not invent line numbers."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"CODE:\n{code}\n\n"
-                    f"TRACEBACK:\n{error_traceback}\n\n"
-                    'Return JSON: {"error_lines": [3]}'
-                ),
-            },
-        ],
-        response_format={"type": "json_object"},
-    )
-
-    content = response.choices[0].message.content
-    data = json.loads(content)
-    result = ErrorAnalysis.model_validate(data)
-
-    return sorted(set(
-        line for line in result.error_lines
-        if 1 <= line <= len(code.splitlines())
-    ))
+        sys.stderr = old_stderr
 
 
 def extract_error_lines(code: str, error_traceback: str) -> List[int]:
+    # Only consider traceback frames referring to submitted code.
     matches = re.findall(
         r'File "<string>", line (\d+)',
         error_traceback,
@@ -104,12 +73,49 @@ def extract_error_lines(code: str, error_traceback: str) -> List[int]:
     if not matches:
         return []
 
-    line = int(matches[-1])
+    line_number = int(matches[-1])
 
-    if 1 <= line <= len(code.splitlines()):
-        return [line]
+    if 1 <= line_number <= len(code.splitlines()):
+        return [line_number]
 
     return []
+
+
+def analyze_error_with_ai(
+    code: str,
+    error_traceback: str,
+) -> List[int]:
+    response = client.chat.completions.create(
+        model="openai/gpt-4.1-nano",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Identify the exact 1-based line number in the "
+                    "submitted Python code where the exception occurs. "
+                    'Return JSON only: {"error_lines": [3]}. '
+                    "Do not invent line numbers."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"CODE:\n{code}\n\n"
+                    f"TRACEBACK:\n{error_traceback}"
+                ),
+            },
+        ],
+        response_format={"type": "json_object"},
+    )
+
+    content = response.choices[0].message.content
+    data = json.loads(content)
+    parsed = ErrorAnalysis.model_validate(data)
+
+    return sorted({
+        n for n in parsed.error_lines
+        if 1 <= n <= len(code.splitlines())
+    })
 
 
 @app.post("/code-interpreter")
@@ -122,23 +128,23 @@ def code_interpreter(request: CodeRequest):
             "result": execution["output"],
         }
 
-    # AI analyzes the traceback only when execution fails.
+    # Analyze errors with AI only when execution fails.
     try:
-        error_lines = analyze_error_with_ai(
+        ai_lines = analyze_error_with_ai(
             request.code,
             execution["output"],
         )
     except Exception:
-        error_lines = []
+        ai_lines = []
 
-    # Use the traceback to correct or recover the line number.
+    # The actual traceback is authoritative when it identifies
+    # a line in the submitted code.
     traceback_lines = extract_error_lines(
         request.code,
         execution["output"],
     )
 
-    if traceback_lines:
-        error_lines = traceback_lines
+    error_lines = traceback_lines or ai_lines
 
     return {
         "error": error_lines,
